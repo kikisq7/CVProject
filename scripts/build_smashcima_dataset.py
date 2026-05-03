@@ -38,17 +38,39 @@ from datasets import (
 from tqdm import tqdm
 
 
-def _load_source_dataset(source: str):
+def _load_source_dataset(source: str, slice_per_split: Optional[int] = None):
     """Load the source dataset from either a local on-disk path or the HF Hub.
 
     A local directory is expected to contain a ``DatasetDict`` previously
     saved with ``save_to_disk``. Anything else is treated as a Hub repo id
     and loaded with ``datasets.load_dataset`` so this script works
-    unchanged on Colab where data lives on the Hub.
+    unchanged on Colab where data lives on the Hub. ``token=True`` is
+    passed through so gated datasets work after ``huggingface_hub.login``.
+
+    If ``slice_per_split`` is set, only ``train[:N]``, ``val[:N]``,
+    ``test[:N]`` are downloaded. This matters on Colab because PDMX-Synth
+    is ~19 GB and downloading everything is wasteful when we only need a
+    few hundred examples for a T4 run.
     """
     if os.path.isdir(source):
         return load_from_disk(source)
-    return load_dataset(source)
+    if slice_per_split is None:
+        return load_dataset(source, token=True)
+
+    out = {}
+    for split_name in ("train", "val", "validation", "test"):
+        try:
+            out[split_name] = load_dataset(
+                source, split=f"{split_name}[:{slice_per_split}]", token=True
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Some datasets only expose train/test, etc.
+            print(f"  [skip-split] {split_name}: {exc}")
+    if "validation" in out and "val" not in out:
+        out["val"] = out.pop("validation")
+    from datasets import DatasetDict as _DD
+
+    return _DD(out)
 
 
 @dataclass
@@ -76,16 +98,46 @@ def _render_one_page(musicxml_str: str, seed: int) -> Image.Image:
     return page_images[0]
 
 
+_MUSICXML_CANDIDATES = ("musicxml", "music_xml", "mxl", "xml", "score_musicxml", "musicxml_str")
+
+
+def _detect_musicxml_column(source_split, requested: str) -> Optional[str]:
+    """Return a usable MusicXML column name, or ``None``.
+
+    If the user passed an explicit column name, honor it. Otherwise try a
+    short list of likely names. We confirm a column is "usable" by peeking
+    at the first row and checking the value is a non-empty string -- many
+    HF dataset exports include a typed column with NULL everywhere.
+    """
+    columns = list(source_split.column_names)
+    print(f"  source columns: {columns}")
+    candidates = [requested] if requested and requested != "auto" else list(_MUSICXML_CANDIDATES)
+    for col in candidates:
+        if col in columns:
+            sample = source_split[0].get(col)
+            print(f"  candidate column '{col}': type={type(sample).__name__}, "
+                  f"len={len(sample) if hasattr(sample, '__len__') else 'n/a'}, "
+                  f"is_none={sample is None}")
+            if sample is not None and (not hasattr(sample, "__len__") or len(sample) > 0):
+                return col
+    return None
+
+
 def _iter_source_samples(source_dataset, musicxml_column: str) -> Iterable[RenderSpec]:
+    skipped = 0
+    yielded = 0
     for example in source_dataset:
         mx = example.get(musicxml_column)
-        if mx is None:
+        if mx is None or (hasattr(mx, "__len__") and len(mx) == 0):
+            skipped += 1
             continue
+        yielded += 1
         yield RenderSpec(
-            filename=str(example.get("filename", example.get("id", "unknown"))),
-            transcription=example["transcription"],
+            filename=str(example.get("filename", example.get("id", f"sample_{yielded}"))),
+            transcription=example.get("transcription", ""),
             musicxml=mx,
         )
+    print(f"  iterated {yielded + skipped} examples (yielded={yielded}, skipped={skipped})")
 
 
 def build_split(
@@ -142,8 +194,22 @@ def main():
     )
     parser.add_argument(
         "--musicxml_column",
-        default="musicxml",
-        help="Name of the column containing MusicXML strings.",
+        default="auto",
+        help=(
+            "Name of the column containing MusicXML strings. Use 'auto' "
+            "(the default) to detect among musicxml / music_xml / mxl / "
+            "xml / score_musicxml / musicxml_str."
+        ),
+    )
+    parser.add_argument(
+        "--source_split_slice",
+        type=int,
+        default=None,
+        help=(
+            "When loading from the HF Hub, only download the first N rows "
+            "of each split. Saves a lot of time on Colab; the script later "
+            "caps further with --max_train / --max_val / --max_test."
+        ),
     )
     parser.add_argument(
         "--output_dir",
@@ -166,7 +232,8 @@ def main():
     args = parser.parse_args()
 
     print(f"Loading source dataset from {args.source_dataset}")
-    source = _load_source_dataset(args.source_dataset)
+    source = _load_source_dataset(args.source_dataset, args.source_split_slice)
+    print(f"Source splits: {list(source.keys())}")
 
     out = DatasetDict()
     for split_name, cap in (
@@ -177,9 +244,20 @@ def main():
         if split_name not in source:
             print(f"[warn] source dataset has no split '{split_name}', skipping")
             continue
-        print(f"Rendering split: {split_name}")
+        print(f"\n=== Rendering split: {split_name} ({len(source[split_name])} source rows) ===")
+        col = _detect_musicxml_column(source[split_name], args.musicxml_column)
+        if col is None:
+            raise SystemExit(
+                f"No usable MusicXML column found in split '{split_name}'.\n"
+                f"  columns available: {source[split_name].column_names}\n"
+                f"  PDMX-Synth ships rendered images + ABC transcriptions but does NOT\n"
+                f"  contain MusicXML strings inline. Use\n"
+                f"    scripts/build_handwritten_aug_dataset.py\n"
+                f"  to derive a handwritten-style dataset from the existing typeset images."
+            )
+        print(f"  using column: {col}")
         out[split_name] = build_split(
-            source[split_name], args.musicxml_column, args.seed, cap, args.image_format
+            source[split_name], col, args.seed, cap, args.image_format
         )
 
     os.makedirs(args.output_dir, exist_ok=True)
