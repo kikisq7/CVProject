@@ -18,7 +18,13 @@ from transformers import (
 from transformers.trainer import TRAINER_STATE_NAME
 from accelerate.logging import get_logger
 from legato.config import DataArguments, ModelArguments
-from legato.models import LegatoConfig, LegatoModel 
+from legato.models import (
+    LegatoConfig,
+    LegatoModel,
+    apply_peft,
+    load_peft_adapters,
+    count_trainable_parameters,
+)
 from legato.trainer import LegatoTrainer
 from legato.metrics import compute_error_rates
 
@@ -61,11 +67,74 @@ def main():
     #### Load model and tokenizer
     set_seed(training_args.seed)
 
+    # Optional bitsandbytes quantization for the frozen vision encoder.
+    # Used to fit legato-small into a 16 GB T4 with PEFT enabled (QLoRA-style).
+    quantization_config = None
+    if model_args.load_in_4bit or model_args.load_in_8bit:
+        from transformers import BitsAndBytesConfig
+
+        if model_args.load_in_4bit:
+            compute_dtype = getattr(torch, model_args.bnb_4bit_compute_dtype)
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=compute_dtype,
+            )
+        else:
+            quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+
+    model_load_kwargs = {}
+    if quantization_config is not None:
+        model_load_kwargs["quantization_config"] = quantization_config
+
     if model_args.pretrained_model:
-        model = AutoModel.from_pretrained(model_args.pretrained_model)
+        model = AutoModel.from_pretrained(model_args.pretrained_model, **model_load_kwargs)
     else:
         config = AutoConfig.from_pretrained(model_args.model_config)
         model = LegatoModel(config)
+
+    if quantization_config is not None:
+        try:
+            from peft import prepare_model_for_kbit_training
+
+            model = prepare_model_for_kbit_training(
+                model,
+                use_gradient_checkpointing=getattr(training_args, "gradient_checkpointing", False),
+            )
+            logger.info(
+                f"Loaded model with bitsandbytes "
+                f"{'4-bit NF4' if model_args.load_in_4bit else '8-bit'} quantization."
+            )
+        except ImportError:
+            logger.warning("peft not installed; skipping prepare_model_for_kbit_training.")
+
+    # Attach PEFT adapters if requested. When an adapter checkpoint is
+    # provided, load it in trainable mode for resumed training or in
+    # inference mode when only evaluating / predicting.
+    if model_args.peft_adapter_path:
+        is_trainable = training_args.do_train
+        model = load_peft_adapters(
+            model, model_args.peft_adapter_path, is_trainable=is_trainable
+        )
+        logger.info(f"Loaded PEFT adapters from {model_args.peft_adapter_path}")
+    elif model_args.peft_strategy and model_args.peft_strategy.lower() != "none":
+        model = apply_peft(
+            model,
+            strategy=model_args.peft_strategy,
+            vision_rank=model_args.vision_rank,
+            decoder_rank=model_args.decoder_rank,
+            alpha=model_args.peft_alpha,
+            dropout=model_args.peft_dropout,
+        )
+        stats = count_trainable_parameters(model)
+        logger.info(
+            f"Applied PEFT strategy={model_args.peft_strategy} "
+            f"(vision_rank={model_args.vision_rank}, "
+            f"decoder_rank={model_args.decoder_rank}, alpha={model_args.peft_alpha}). "
+            f"Trainable: {stats['trainable_params']:,} / {stats['total_params']:,} "
+            f"({100 * stats['trainable_ratio']:.3f}%)."
+        )
 
     processor = AutoProcessor.from_pretrained(model_args.model_config)
     tokenizer = processor.tokenizer
