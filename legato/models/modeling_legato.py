@@ -79,10 +79,15 @@ class LegatoModel(MllamaForConditionalGeneration):
         state_dict: dict = None, 
         **kwargs
     ) -> None:
+        # When PEFT adapters are attached, `save_pretrained` is called on the
+        # outer `PeftModel` (which only writes adapter weights) and this
+        # method is not hit. If it is hit directly with a user-supplied
+        # state_dict, trust the caller. Otherwise strip the frozen vision
+        # backbone just like the original Legato behaviour.
         if state_dict is None:
             state_dict = {
-                name : 
-                    param for name, param in self.state_dict().items() 
+                name:
+                    param for name, param in self.state_dict().items()
                     if not name.startswith("vision_model.")
             }
         super().save_pretrained(save_directory, state_dict=state_dict, **kwargs)

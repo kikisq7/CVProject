@@ -16,8 +16,28 @@ from transformers.trainer import *
 class LegatoTrainer(Seq2SeqTrainer):
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         """
-        Skip the vision model parameters when saving the model.
+        For a plain Legato model, skip the frozen vision backbone when saving.
+        For a PEFT-wrapped model (LoRA / DoRA / DLoRA), delegate to
+        ``PeftModel.save_pretrained`` so only adapter weights are persisted.
         """
+        try:
+            from peft import PeftModel
+        except ImportError:  # peft not installed; legacy path only
+            PeftModel = tuple()
+
+        if PeftModel and isinstance(self.model, PeftModel):
+            output_dir = output_dir if output_dir is not None else self.args.output_dir
+            os.makedirs(output_dir, exist_ok=True)
+            # PeftModel.save_pretrained writes adapter_config.json and
+            # adapter_model.safetensors (or per-adapter subfolders for
+            # multi-adapter models) without touching the frozen base weights.
+            self.model.save_pretrained(output_dir)
+            if self.processing_class is not None:
+                self.processing_class.save_pretrained(output_dir)
+            # Persist TrainingArguments for reproducibility.
+            torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
+            return
+
         if state_dict is None:
             state_dict = self.model.state_dict()
         state_dict = {
