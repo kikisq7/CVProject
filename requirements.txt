@@ -3,6 +3,10 @@ datasets==3.2.0
 fire==0.7.0
 transformers==4.54.0
 torch==2.6.0
+# torchvision MUST match torch (transformers' image_utils imports torchvision.ops.nms;
+# Colab's preinstalled torchvision is built for a different torch, hence the
+# `RuntimeError: operator torchvision::nms does not exist` when versions diverge).
+torchvision==0.21.0
 pillow==11.1.0
 # Colab often installs NumPy 2.4+, which removes private APIs (e.g. _no_nep50_warning)
 # that older pandas/pyarrow wheels still expect when datasets loads Parquet. Cap below 2.4
