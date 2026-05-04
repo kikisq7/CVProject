@@ -202,7 +202,8 @@ def main():
         results = [compute_error_rates(
             tokenizer, training_args.dataloader_num_workers, *metric_targets.values(), preds
         )] if training_args.process_index == 0 else [None]
-        dist.broadcast_object_list(results, src=0)
+        if dist.is_available() and dist.is_initialized():
+            dist.broadcast_object_list(results, src=0)
         return results[0]
 
     # HF Trainer.__init__ refuses a purely quantized base model (no PEFT) even
