@@ -22,4 +22,8 @@ pyparsing
 zss
 peft>=0.13.0
 smashcima
+# MUSCIMA++ MuNG v2 → approx. ABC in scripts/build_muscima_dataset.py
+mung>=1.0.0
+music21>=9.1.0
+lxml>=4.9.0
 musicdiff @ git+ssh://git@github.com/guang-yng/efficient-musicdiff.git

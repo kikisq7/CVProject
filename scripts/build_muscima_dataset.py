@@ -8,9 +8,14 @@ set ``transcription`` either by:
 * passing ``--abc_dir`` with ``.abc`` files whose stems match the page PNGs, or
 * passing ``--musicxml_dir`` with ``.musicxml`` / ``.xml`` files (same stems)
   and a **MuseScore** installation so we can batch-convert MusicXML→ABC.
+* using ``--auto_download`` (default) together with ``--auto_download_mung``:
+  we fetch **MUSCIMA++ v2** MuNG XML, collect per-notehead ``midi_pitch_code``,
+  build a monophonic MusicXML via **music21**, then ABC via **MuseScore**.
+  This reference is **approximate** (reading order / voicing simplified) but
+  makes SER/CER well-defined.
 
-Without ABC or convertible MusicXML, images are still usable for qualitative
-inference, but token SER/CER will be undefined (empty references).
+Without any of the above, images are still usable for qualitative inference,
+but token SER/CER will be undefined (empty references).
 
 Expected on-disk layout (when you supply symbols)::
 
@@ -31,7 +36,7 @@ import os
 import shutil
 import subprocess
 import tempfile
-from typing import Iterator, Optional
+from typing import Iterator, List, Optional
 
 from PIL import Image
 from datasets import Dataset, DatasetDict, Features, Image as HFImage, Value
@@ -130,6 +135,131 @@ def _musicxml_to_abc(
     return ""
 
 
+def _find_mung_annotations_dir(search_root: str) -> Optional[str]:
+    """Return the directory under ``search_root`` with the most ``CVC-MUSCIMA_*.xml`` MuNG files."""
+    best_dir, best_n = None, 0
+    if not search_root or not os.path.isdir(search_root):
+        return None
+    for dirpath, _, filenames in os.walk(search_root):
+        n = sum(
+            1
+            for f in filenames
+            if f.startswith("CVC-MUSCIMA_") and f.lower().endswith(".xml")
+        )
+        if n > best_n:
+            best_n = n
+            best_dir = dirpath
+    return best_dir
+
+
+def _count_cvc_mung_xml(annotation_dir: Optional[str]) -> int:
+    if not annotation_dir or not os.path.isdir(annotation_dir):
+        return 0
+    return sum(
+        1
+        for f in os.listdir(annotation_dir)
+        if f.startswith("CVC-MUSCIMA_") and f.lower().endswith(".xml")
+    )
+
+
+def _auto_download_muscima_v2_annotations(target_dir: str) -> Optional[str]:
+    """Download MUSCIMA++ v2 (MuNG XML) via omrdatasettools; return annotations directory."""
+    try:
+        from omrdatasettools import Downloader, OmrDataset
+    except ImportError as exc:
+        print(f"[muscima] omrdatasettools required for MuNG v2 download: {exc}")
+        return None
+    os.makedirs(target_dir, exist_ok=True)
+    print(f"[muscima] downloading MuscimaPlusPlus_V2 (MuNG) into {target_dir} ...")
+    try:
+        Downloader().download_and_extract_dataset(OmrDataset.MuscimaPlusPlus_V2, target_dir)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[muscima] MuNG v2 download/extract failed: {exc}")
+        return None
+    found = _find_mung_annotations_dir(target_dir)
+    if found:
+        print(f"[muscima] MuNG XML dir: {found} ({_count_cvc_mung_xml(found)} files)")
+    else:
+        print("[muscima] warning: could not locate MuNG XML after v2 extract.")
+    return found
+
+
+_MUNG_IMPORT_WARNED = False
+
+
+def _extract_midis_from_mung_xml(path: str) -> List[int]:
+    global _MUNG_IMPORT_WARNED
+    try:
+        from mung.io import read_nodes_from_file
+    except ImportError:
+        if not _MUNG_IMPORT_WARNED:
+            print("[muscima] pip install mung lxml to parse MuNG annotations.")
+            _MUNG_IMPORT_WARNED = True
+        return []
+    try:
+        nodes = read_nodes_from_file(path)
+    except Exception:  # noqa: BLE001
+        return []
+    if not nodes:
+        return []
+    events = []
+    for n in nodes:
+        cls = (n.class_name or "").lower()
+        if "notehead" not in cls:
+            continue
+        data = getattr(n, "data", None)
+        if not data:
+            continue
+        midi = data.get("midi_pitch_code")
+        if midi is None:
+            continue
+        try:
+            midi_i = int(midi)
+        except (TypeError, ValueError):
+            continue
+        events.append((n.top, n.left, midi_i))
+    if not events:
+        return []
+    staff_band = 80
+    events.sort(key=lambda t: (-(t[0] // staff_band), t[1]))
+    return [m for _, _, m in events]
+
+
+def _midis_to_abc_via_music21_musescore(
+    midis: List[int],
+    *,
+    musescore_bin: Optional[str] = None,
+) -> str:
+    """Monophonic quarter-note stream → MusicXML (music21) → ABC (MuseScore)."""
+    if not midis:
+        return ""
+    try:
+        from music21 import note as m21note
+        from music21 import stream as m21stream
+    except ImportError:
+        print("[muscima] pip install music21 for MuNG→MusicXML step.")
+        return ""
+    s = m21stream.Stream()
+    for m in midis:
+        s.append(m21note.Note(midi=int(m)))
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            xmlp = os.path.join(td, "ref.musicxml")
+            s.write("musicxml", fp=xmlp)
+            mx = _read_text(xmlp)
+            if not mx:
+                return ""
+            return _musicxml_to_abc(mx, musescore_bin=musescore_bin)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[muscima] music21 MusicXML export failed: {exc}")
+        return ""
+
+
+def _mung_xml_to_abc(path: str, *, musescore_bin: Optional[str] = None) -> str:
+    midis = _extract_midis_from_mung_xml(path)
+    return _midis_to_abc_via_music21_musescore(midis, musescore_bin=musescore_bin)
+
+
 def build_muscima_split(
     images_dir: str,
     musicxml_dir: Optional[str],
@@ -138,6 +268,7 @@ def build_muscima_split(
     *,
     convert_musicxml_to_abc: bool = True,
     musescore_bin: Optional[str] = None,
+    mung_annotations_dir: Optional[str] = None,
 ) -> Dataset:
     image_files = sorted(
         f for f in os.listdir(images_dir)
@@ -166,6 +297,16 @@ def build_muscima_split(
                     musicxml, musescore_bin=musescore_bin
                 )
 
+            mung_path = (
+                _find_sibling(mung_annotations_dir, stem, ".xml")
+                if mung_annotations_dir
+                else None
+            )
+            if not transcription and mung_path:
+                transcription = _mung_xml_to_abc(
+                    mung_path, musescore_bin=musescore_bin
+                )
+
             yield {
                 "filename": stem,
                 "transcription": transcription or "",
@@ -188,7 +329,18 @@ def build_muscima_split(
         f"[muscima] Built {len(ds)} pages: "
         f"{n_tx} with non-empty ABC `transcription`, {n_mx} with raw `musicxml` text."
     )
-    if n_mx and not n_tx and convert_musicxml_to_abc:
+    if n_tx and mung_annotations_dir:
+        print(
+            "[muscima] Note: references from MuNG are monophonic approximations "
+            "(for SER/CER); not identical to full scores."
+        )
+    if not n_tx and mung_annotations_dir and convert_musicxml_to_abc:
+        print(
+            "[muscima] No ABC from MuNG/convert path. "
+            "Install: `pip install mung music21 lxml`, `apt install musescore3`, "
+            "or pass `--abc_dir` / `--musicxml_dir`."
+        )
+    if not n_tx and not mung_annotations_dir and n_mx and convert_musicxml_to_abc:
         print(
             "[muscima] No ABC transcriptions were produced. "
             "Install MuseScore (`apt install musescore3` on Colab/Ubuntu) "
@@ -259,11 +411,29 @@ def main():
         default=None,
         help="Path to MuseScore executable (overrides auto-detect / MUSESCORE_EXECUTABLE).",
     )
+    parser.add_argument(
+        "--mung_annotations_dir",
+        default=None,
+        help="Directory with MUSCIMA++ v2 MuNG XML (CVC-MUSCIMA_*.xml). Overrides auto-download.",
+    )
+    parser.add_argument(
+        "--auto_download_mung",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Download/extract MUSCIMA++ v2 MuNG next to images under download_dir/muscima_v2 (default: True).",
+    )
     args = parser.parse_args()
 
     images_dir = args.images_dir
     if args.auto_download or images_dir is None:
         images_dir = _auto_download_muscima_images(args.download_dir)
+
+    mung_dir: Optional[str] = args.mung_annotations_dir
+    if mung_dir is None and args.auto_download_mung:
+        v2_root = os.path.join(args.download_dir, "muscima_v2")
+        mung_dir = _find_mung_annotations_dir(v2_root)
+        if _count_cvc_mung_xml(mung_dir) < 100:
+            mung_dir = _auto_download_muscima_v2_annotations(v2_root)
 
     ds = build_muscima_split(
         images_dir,
@@ -272,6 +442,7 @@ def main():
         args.image_format,
         convert_musicxml_to_abc=args.convert_musicxml_to_abc,
         musescore_bin=args.musescore_bin,
+        mung_annotations_dir=mung_dir,
     )
     if args.max_samples is not None:
         ds = ds.select(range(min(args.max_samples, len(ds))))
@@ -285,6 +456,8 @@ def main():
             "num_samples": len(ds),
             "split_name": args.split_name,
             "source_images_dir": images_dir,
+            "mung_annotations_dir": mung_dir,
+            "auto_download_mung": args.auto_download_mung,
             "has_abc_dir": bool(args.abc_dir),
             "has_musicxml_dir": bool(args.musicxml_dir),
             "convert_musicxml_to_abc": args.convert_musicxml_to_abc,

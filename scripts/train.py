@@ -1,4 +1,9 @@
 import sys
+
+# Snapshot before other imports: TensorFlow (pulled in transitively) may mutate sys.argv,
+# which breaks "python train.py config.json" detection in main().
+_TRAIN_CLI_ARGV = list(sys.argv)
+
 import torch
 import json
 import os
@@ -31,8 +36,9 @@ from legato.metrics import compute_error_rates
 
 def main():
     parser = HfArgumentParser((Seq2SeqTrainingArguments, DataArguments, ModelArguments))
-    if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
-        training_args, data_args, model_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
+    cli_tail = _TRAIN_CLI_ARGV[1:]
+    if len(cli_tail) == 1 and cli_tail[0].endswith(".json"):
+        training_args, data_args, model_args = parser.parse_json_file(json_file=os.path.abspath(cli_tail[0]))
     else:
         training_args, data_args, model_args = parser.parse_args_into_dataclasses()
 
