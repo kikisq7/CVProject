@@ -9,10 +9,11 @@ set ``transcription`` either by:
 * passing ``--musicxml_dir`` with ``.musicxml`` / ``.xml`` files (same stems)
   and a **MuseScore** installation so we can batch-convert MusicXML→ABC.
 * using ``--auto_download`` (default) together with ``--auto_download_mung``:
-  we fetch **MUSCIMA++ v2** MuNG XML, collect per-notehead ``midi_pitch_code``,
-  build a monophonic MusicXML via **music21**, then ABC via **MuseScore**.
-  This reference is **approximate** (reading order / voicing simplified) but
-  makes SER/CER well-defined.
+  we fetch **MUSCIMA++ v2** MuNG XML. Released v2 files usually **omit**
+  ``midi_pitch_code`` in ``<Data>``; we then **estimate** pitches from
+  staff lines, clef, and notehead vertical position, build monophonic
+  MusicXML via **music21**, then ABC via **MuseScore**.
+  This reference is **approximate** (geometry + monophonic reading order).
 
 Without any of the above, images are still usable for qualitative inference,
 but token SER/CER will be undefined (empty references).
@@ -36,7 +37,7 @@ import os
 import shutil
 import subprocess
 import tempfile
-from typing import Iterator, List, Optional
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 from PIL import Image
 from datasets import Dataset, DatasetDict, Features, Image as HFImage, Value
@@ -162,6 +163,18 @@ def _count_cvc_mung_xml(annotation_dir: Optional[str]) -> int:
     )
 
 
+def _count_cvc_mung_xml_in_tree(root: Optional[str]) -> int:
+    """Count ``CVC-MUSCIMA_*.xml`` MuNG files anywhere under ``root``."""
+    if not root or not os.path.isdir(root):
+        return 0
+    n = 0
+    for _, _, files in os.walk(root):
+        for f in files:
+            if f.startswith("CVC-MUSCIMA_") and f.lower().endswith(".xml"):
+                n += 1
+    return n
+
+
 def _auto_download_muscima_v2_annotations(target_dir: str) -> Optional[str]:
     """Download MUSCIMA++ v2 (MuNG XML) via omrdatasettools; return annotations directory."""
     try:
@@ -185,6 +198,132 @@ def _auto_download_muscima_v2_annotations(target_dir: str) -> Optional[str]:
 
 
 _MUNG_IMPORT_WARNED = False
+_MUNG_GEOM_WARNED = False
+
+# Nine staff positions from top staff line downward (treble / bass). Release MuNG
+# usually omits ``midi_pitch_code``; these tables support geometry-based estimates.
+_TREBLE_MIDIS_TOP_TO_BOTTOM: Tuple[int, ...] = (77, 76, 74, 72, 71, 69, 67, 65, 64)
+_BASS_MIDIS_TOP_TO_BOTTOM: Tuple[int, ...] = (57, 55, 53, 52, 50, 48, 47, 45, 43)
+
+
+def _ycenter(n) -> float:
+    return float(n.top) + float(n.height) * 0.5
+
+
+def _find_mung_xml_path(search_root: Optional[str], stem: str) -> Optional[str]:
+    """Locate ``CVC-MUSCIMA_*.xml`` for page ``stem`` under ``search_root`` (recursive)."""
+    if not search_root or not os.path.isdir(search_root):
+        return None
+    want = [f"{stem}.xml", f"CVC-MUSCIMA_{stem}.xml"]
+    for name in want:
+        direct = os.path.join(search_root, name)
+        if os.path.isfile(direct):
+            return direct
+    if stem.startswith("CVC-MUSCIMA_"):
+        short = stem[len("CVC-MUSCIMA_") :]
+        alt = os.path.join(search_root, f"{short}.xml")
+        if os.path.isfile(alt):
+            return alt
+    stem_l = stem.lower()
+    for dirpath, _, files in os.walk(search_root):
+        for f in files:
+            if not f.lower().endswith(".xml") or not f.startswith("CVC-MUSCIMA_"):
+                continue
+            base = f[:-4]
+            if base == stem or base.lower() == stem_l:
+                return os.path.join(dirpath, f)
+    return None
+
+
+def _group_stafflines_by_staff(
+    staff_boxes: List, staff_lines: List
+) -> Dict[int, List]:
+    groups: Dict[int, List] = {}
+    for st in staff_boxes:
+        groups[id(st)] = []
+        y0, y1 = float(st.top), float(st.top + st.height)
+        for ln in staff_lines:
+            yc = _ycenter(ln)
+            if y0 - 3.0 <= yc <= y1 + 3.0:
+                groups[id(st)].append(ln)
+    return groups
+
+
+def _clef_kind_for_staff(staff, clefs: Sequence) -> str:
+    y0, y1 = float(staff.top), float(staff.top + staff.height)
+    sx = float(staff.left)
+    for c in clefs:
+        cy = _ycenter(c)
+        if not (y0 - 15.0 <= cy <= y1 + 15.0):
+            continue
+        if float(c.left) > sx + 1200.0:
+            continue
+        name = (c.class_name or "")
+        if name == "gClef":
+            return "treble"
+        if name == "fClef":
+            return "bass"
+    return "treble"
+
+
+def _midis_from_staff_geometry(nodes) -> List[int]:
+    """Estimate MIDI pitches from staff lines + clef + notehead Y (release MuNG has no Data pitch)."""
+    global _MUNG_GEOM_WARNED
+    staff_boxes = [n for n in nodes if (n.class_name or "") == "staff"]
+    staff_lines = [n for n in nodes if (n.class_name or "") == "staffLine"]
+    clefs = [n for n in nodes if (n.class_name or "") in ("gClef", "fClef")]
+    noteheads = [
+        n
+        for n in nodes
+        if "notehead" in (n.class_name or "").lower()
+        and "rest" not in (n.class_name or "").lower()
+        and "grace" not in (n.class_name or "").lower()
+    ]
+    if not staff_boxes or not staff_lines or not noteheads:
+        if not _MUNG_GEOM_WARNED:
+            print(
+                "[muscima] MuNG geometry: need staff + staffLine + notehead nodes "
+                f"(have {len(staff_boxes)}/{len(staff_lines)}/{len(noteheads)})."
+            )
+            _MUNG_GEOM_WARNED = True
+        return []
+    groups = _group_stafflines_by_staff(staff_boxes, staff_lines)
+    # Order systems: top-to-bottom, then left-to-right.
+    sorted_staffs = sorted(
+        staff_boxes,
+        key=lambda s: (float(s.top) + float(s.height) * 0.5, float(s.left)),
+    )
+    events: List[Tuple[float, float, int]] = []
+    for st in sorted_staffs:
+        lines = groups.get(id(st), [])
+        if len(lines) < 3:
+            continue
+        line_ys = sorted(_ycenter(ln) for ln in lines)
+        y_top, y_bot = line_ys[0], line_ys[-1]
+        if y_bot <= y_top:
+            continue
+        table = _TREBLE_MIDIS_TOP_TO_BOTTOM
+        if _clef_kind_for_staff(st, clefs) == "bass":
+            table = _BASS_MIDIS_TOP_TO_BOTTOM
+        sy0, sy1 = float(st.top), float(st.top + st.height)
+        for nh in noteheads:
+            yc = _ycenter(nh)
+            if not (sy0 - 5.0 <= yc <= sy1 + 5.0):
+                continue
+            frac = (yc - y_top) / (y_bot - y_top) * 8.0
+            idx = int(round(frac))
+            idx = max(0, min(8, idx))
+            midi_i = table[idx]
+            events.append((float(st.top), float(nh.left), midi_i))
+    if not events:
+        if not _MUNG_GEOM_WARNED:
+            print("[muscima] MuNG geometry: no noteheads matched staff boxes.")
+            _MUNG_GEOM_WARNED = True
+        return []
+    events.sort(key=lambda t: (t[0], t[1]))
+    if len(events) > 10000:
+        events = events[:10000]
+    return [m for _, _, m in events]
 
 
 def _extract_midis_from_mung_xml(path: str) -> List[int]:
@@ -198,7 +337,8 @@ def _extract_midis_from_mung_xml(path: str) -> List[int]:
         return []
     try:
         nodes = read_nodes_from_file(path)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        print(f"[muscima] read_nodes_from_file failed ({path}): {exc}")
         return []
     if not nodes:
         return []
@@ -218,11 +358,52 @@ def _extract_midis_from_mung_xml(path: str) -> List[int]:
         except (TypeError, ValueError):
             continue
         events.append((n.top, n.left, midi_i))
-    if not events:
-        return []
-    staff_band = 80
-    events.sort(key=lambda t: (-(t[0] // staff_band), t[1]))
-    return [m for _, _, m in events]
+    if events:
+        staff_band = 80
+        events.sort(key=lambda t: (-(t[0] // staff_band), t[1]))
+        return [m for _, _, m in events]
+
+    return _midis_from_staff_geometry(nodes)
+
+
+def _midis_to_abc_primitive(midis: List[int]) -> str:
+    """Last-resort monophonic ABC (quarter notes) without MuseScore."""
+    if not midis:
+        return ""
+    try:
+        from music21.pitch import Pitch
+    except ImportError:
+        return ""
+    tokens = []
+    for m in midis:
+        p = Pitch(midi=int(m))
+        acc = ""
+        if p.accidental is not None and p.accidental.alter != 0:
+            al = float(p.accidental.alter)
+            if al == 1.0:
+                acc = "^"
+            elif al == -1.0:
+                acc = "_"
+            elif al == 2.0:
+                acc = "^^"
+            elif al == -2.0:
+                acc = "__"
+        step = p.step
+        oct_shift = int(p.octave) - 4
+        if oct_shift >= 0:
+            body = step.lower() + acc + ("'" * oct_shift)
+        else:
+            body = step.upper() + acc + ("," * (-oct_shift))
+        tokens.append(body)
+    voice = " ".join(tokens)
+    return (
+        "X:1\n"
+        "T:muscima-ref\n"
+        "M:4/4\n"
+        "L:1/4\n"
+        "K:none\n"
+        f"| {voice} |\n"
+    )
 
 
 def _midis_to_abc_via_music21_musescore(
@@ -248,11 +429,13 @@ def _midis_to_abc_via_music21_musescore(
             s.write("musicxml", fp=xmlp)
             mx = _read_text(xmlp)
             if not mx:
-                return ""
-            return _musicxml_to_abc(mx, musescore_bin=musescore_bin)
+                return _midis_to_abc_primitive(midis)
+            out = _musicxml_to_abc(mx, musescore_bin=musescore_bin)
+            if out.strip():
+                return out
     except Exception as exc:  # noqa: BLE001
         print(f"[muscima] music21 MusicXML export failed: {exc}")
-        return ""
+    return _midis_to_abc_primitive(midis)
 
 
 def _mung_xml_to_abc(path: str, *, musescore_bin: Optional[str] = None) -> str:
@@ -298,7 +481,7 @@ def build_muscima_split(
                 )
 
             mung_path = (
-                _find_sibling(mung_annotations_dir, stem, ".xml")
+                _find_mung_xml_path(mung_annotations_dir, stem)
                 if mung_annotations_dir
                 else None
             )
@@ -338,7 +521,8 @@ def build_muscima_split(
         print(
             "[muscima] No ABC from MuNG/convert path. "
             "Install: `pip install mung music21 lxml`, `apt install musescore3`, "
-            "or pass `--abc_dir` / `--musicxml_dir`."
+            "or pass `--abc_dir` / `--musicxml_dir`. "
+            "If MuNG downloaded but MIDI list empty, check MuNG parse logs above."
         )
     if not n_tx and not mung_annotations_dir and n_mx and convert_musicxml_to_abc:
         print(
@@ -428,12 +612,14 @@ def main():
     if args.auto_download or images_dir is None:
         images_dir = _auto_download_muscima_images(args.download_dir)
 
-    mung_dir: Optional[str] = args.mung_annotations_dir
-    if mung_dir is None and args.auto_download_mung:
+    mung_search_root: Optional[str] = None
+    if args.mung_annotations_dir:
+        mung_search_root = os.path.abspath(args.mung_annotations_dir)
+    elif args.auto_download_mung:
         v2_root = os.path.join(args.download_dir, "muscima_v2")
-        mung_dir = _find_mung_annotations_dir(v2_root)
-        if _count_cvc_mung_xml(mung_dir) < 100:
-            mung_dir = _auto_download_muscima_v2_annotations(v2_root)
+        if _count_cvc_mung_xml_in_tree(v2_root) < 130:
+            _auto_download_muscima_v2_annotations(v2_root)
+        mung_search_root = v2_root
 
     ds = build_muscima_split(
         images_dir,
@@ -442,7 +628,7 @@ def main():
         args.image_format,
         convert_musicxml_to_abc=args.convert_musicxml_to_abc,
         musescore_bin=args.musescore_bin,
-        mung_annotations_dir=mung_dir,
+        mung_annotations_dir=mung_search_root,
     )
     if args.max_samples is not None:
         ds = ds.select(range(min(args.max_samples, len(ds))))
@@ -456,7 +642,8 @@ def main():
             "num_samples": len(ds),
             "split_name": args.split_name,
             "source_images_dir": images_dir,
-            "mung_annotations_dir": mung_dir,
+            "mung_annotations_dir": mung_search_root,
+            "mung_cvc_xml_count": _count_cvc_mung_xml_in_tree(mung_search_root),
             "auto_download_mung": args.auto_download_mung,
             "has_abc_dir": bool(args.abc_dir),
             "has_musicxml_dir": bool(args.musicxml_dir),
