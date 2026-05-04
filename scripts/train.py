@@ -203,9 +203,9 @@ def main():
         model=model,
         args=training_args,
         data_collator=collate_fn,
-        train_dataset=dataset['train'],
-        eval_dataset=dataset['val'],
-        compute_metrics=metric_fn
+        train_dataset=dataset['train'] if 'train' in dataset else None,
+        eval_dataset=dataset['val'] if 'val' in dataset else None,
+        compute_metrics=metric_fn,
     )
 
     def _unwrap_and_save_model(trainer, output_dir):
