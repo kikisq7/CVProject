@@ -98,10 +98,29 @@ def apply_peft(
     # decoder adapter on top of the resulting PeftModel.
     peft_model = get_peft_model(model, vision_config, adapter_name=VISION_ADAPTER_NAME)
     peft_model.add_adapter(DECODER_ADAPTER_NAME, decoder_config)
-    peft_model.set_adapter([VISION_ADAPTER_NAME, DECODER_ADAPTER_NAME])
+    _activate_adapters(peft_model, [VISION_ADAPTER_NAME, DECODER_ADAPTER_NAME])
 
     _ensure_adapters_trainable(peft_model)
     return peft_model
+
+
+def _activate_adapters(peft_model: PeftModel, adapter_names: list) -> None:
+    """Activate multiple adapters simultaneously.
+
+    ``PeftModel.set_adapter`` (the user-facing wrapper) only accepts a single
+    adapter name in current ``peft`` releases; passing a list raises
+    ``TypeError: unhashable type: 'list'``. The underlying tuner
+    (``peft_model.base_model``, e.g. ``LoraModel``) does accept a list, which
+    is the documented way to activate multiple disjoint LoRA/DoRA adapters
+    (as in our DLoRA setup, where vision and decoder adapters target
+    non-overlapping modules).
+    """
+    base = getattr(peft_model, "base_model", None)
+    if base is not None and hasattr(base, "set_adapter"):
+        base.set_adapter(adapter_names)
+    else:  # fall back to single-adapter activation for older peft layouts
+        for name in adapter_names:
+            peft_model.set_adapter(name)
 
 
 def _ensure_adapters_trainable(peft_model: PeftModel) -> None:
@@ -174,7 +193,7 @@ def load_peft_adapters(base_model, adapter_path: str, is_trainable: Optional[boo
                 adapter_name=extra,
                 is_trainable=bool(is_trainable),
             )
-        peft_model.set_adapter(subdirs)
+        _activate_adapters(peft_model, subdirs)
         return peft_model
 
     # Single-adapter layout.
