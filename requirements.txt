@@ -4,11 +4,15 @@ fire==0.7.0
 transformers==4.54.0
 torch==2.6.0
 pillow==11.1.0
-numpy==1.26.4
+# Loose range: Colab ships NumPy 2.x; pinning ==1.26.4 downgrades half the stack and leaves
+# broken mixed installs (numpy._core vs 1.x .so). Local CUDA setups work with 1.26 or 2.x.
+numpy>=1.26.4,<3.0
 deepspeed
 Levenshtein
 tqdm
 wandb
 pyparsing
 zss
+peft>=0.13.0
+smashcima
 musicdiff @ git+ssh://git@github.com/guang-yng/efficient-musicdiff.git
