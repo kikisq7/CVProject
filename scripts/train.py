@@ -199,6 +199,112 @@ def main():
         dist.broadcast_object_list(results, src=0)
         return results[0]
 
+    # HF Trainer.__init__ refuses a purely quantized base model (no PEFT) even
+    # for predict-only runs. For zero-shot baseline eval we bypass Trainer and
+    # run a minimal generation loop instead.
+    def _is_peft_model(m):
+        try:
+            from peft import PeftModel
+        except ImportError:
+            PeftModel = ()
+        if PeftModel and isinstance(m, PeftModel):
+            return True
+        return getattr(m, "_hf_peft_config_loaded", False) or hasattr(m, "peft_config")
+
+    predict_only = (
+        training_args.do_predict
+        and not training_args.do_train
+        and not training_args.do_eval
+    )
+    quantized_no_peft = (
+        getattr(model, "is_quantized", False)
+        or quantization_config is not None
+    ) and not _is_peft_model(model)
+
+    if predict_only and quantized_no_peft:
+        from torch.utils.data import DataLoader
+        try:
+            from tqdm.auto import tqdm
+        except ImportError:  # tqdm is a transformers dep; fallback just in case
+            def tqdm(x, **_):
+                return x
+
+        logger.info(
+            "Running quantized predict-only path (bypassing HF Trainer because "
+            "the base model is purely quantized with no PEFT adapters)."
+        )
+
+        model.eval()
+        try:
+            device = next(model.parameters()).device
+        except StopIteration:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        loader = DataLoader(
+            dataset['test'],
+            batch_size=training_args.per_device_eval_batch_size,
+            collate_fn=collate_fn,
+            num_workers=training_args.dataloader_num_workers,
+        )
+
+        gen_kwargs = {}
+        if training_args.generation_max_length is not None:
+            gen_kwargs["max_length"] = training_args.generation_max_length
+        if training_args.generation_num_beams is not None:
+            gen_kwargs["num_beams"] = training_args.generation_num_beams
+
+        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+
+        all_preds = []
+        for batch in tqdm(loader, desc="predict"):
+            gen_inputs = {
+                k.replace("gen_", ""): (v.to(device) if hasattr(v, "to") else v)
+                for k, v in batch.items()
+                if k.startswith("gen_")
+            }
+            gen_inputs.pop("labels", None)
+            length = gen_inputs["input_ids"].shape[1]
+            with torch.inference_mode():
+                generated = model.generate(**gen_inputs, **gen_kwargs)
+            # Mirror Seq2SeqTrainer.prediction_step: keep the last prompt
+            # token + everything generated after it.
+            generated = generated[:, length - 1:].detach().cpu().numpy()
+            all_preds.append(generated)
+
+        if all_preds:
+            max_len = max(p.shape[1] for p in all_preds)
+            padded = []
+            for p in all_preds:
+                if p.shape[1] < max_len:
+                    pad = np.full(
+                        (p.shape[0], max_len - p.shape[1]), pad_id, dtype=p.dtype
+                    )
+                    p = np.concatenate([p, pad], axis=1)
+                padded.append(p)
+            predictions = np.concatenate(padded, axis=0)
+        else:
+            predictions = np.zeros((0, 0), dtype=np.int64)
+
+        os.makedirs(training_args.output_dir, exist_ok=True)
+        abc_outputs = processor.batch_decode(predictions, skip_special_tokens=True)
+        preds = remove_special_tokens(predictions)
+        with open(os.path.join(training_args.output_dir, "test_predictions.json"), "w") as f:
+            json.dump(
+                {'abc_transcription': abc_outputs,
+                 'tokens': [p.tolist() for p in preds]},
+                f,
+            )
+
+        if metric_targets:
+            results = compute_error_rates(
+                tokenizer,
+                training_args.dataloader_num_workers,
+                *metric_targets.values(),
+                preds,
+            )
+            logger.info(f"Test metrics: {results}")
+        return
+
     trainer = LegatoTrainer(
         model=model,
         args=training_args,
