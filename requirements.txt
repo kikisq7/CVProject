@@ -4,9 +4,12 @@ fire==0.7.0
 transformers==4.54.0
 torch==2.6.0
 pillow==11.1.0
-# Loose range: Colab ships NumPy 2.x; pinning ==1.26.4 downgrades half the stack and leaves
-# broken mixed installs (numpy._core vs 1.x .so). Local CUDA setups work with 1.26 or 2.x.
-numpy>=1.26.4,<3.0
+# Colab often installs NumPy 2.4+, which removes private APIs (e.g. _no_nep50_warning)
+# that older pandas/pyarrow wheels still expect when datasets loads Parquet. Cap below 2.4
+# until the whole stack (pandas, pyarrow, datasets) ships wheels built against NumPy 2.4.
+numpy>=1.26.4,<2.4
+pandas>=2.2.0
+pyarrow>=15.0.0
 deepspeed
 Levenshtein
 tqdm
