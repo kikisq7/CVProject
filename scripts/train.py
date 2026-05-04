@@ -296,13 +296,22 @@ def main():
             )
 
         if metric_targets:
-            results = compute_error_rates(
-                tokenizer,
-                training_args.dataloader_num_workers,
-                *metric_targets.values(),
-                preds,
-            )
-            logger.info(f"Test metrics: {results}")
+            ref_label_ids = next(iter(metric_targets.values()))
+            total_ref_tokens = sum(len(r) for r in ref_label_ids)
+            if total_ref_tokens == 0:
+                logger.info(
+                    "Skipping ABC error-rate computation: dataset has no ABC "
+                    "transcriptions (e.g. MUSCIMA++). test_predictions.json "
+                    "was still written for downstream OMR-NED / TEDn eval."
+                )
+            else:
+                results = compute_error_rates(
+                    tokenizer,
+                    training_args.dataloader_num_workers,
+                    *metric_targets.values(),
+                    preds,
+                )
+                logger.info(f"Test metrics: {results}")
         return
 
     trainer = LegatoTrainer(
@@ -366,10 +375,19 @@ def main():
                 json.dump({'abc_transcription': abc_outputs, 'tokens': [p.tolist() for p in preds]}, f)
 
             if metric_targets:
-                results = compute_error_rates(
-                    tokenizer, training_args.dataloader_num_workers, *metric_targets.values(), preds
-                )
-                trainer.log_metrics("test", results)
+                ref_label_ids = next(iter(metric_targets.values()))
+                total_ref_tokens = sum(len(r) for r in ref_label_ids)
+                if total_ref_tokens == 0:
+                    logger.info(
+                        "Skipping ABC error-rate computation: dataset has no "
+                        "ABC transcriptions (e.g. MUSCIMA++). predictions "
+                        "saved for downstream OMR-NED / TEDn eval."
+                    )
+                else:
+                    results = compute_error_rates(
+                        tokenizer, training_args.dataloader_num_workers, *metric_targets.values(), preds
+                    )
+                    trainer.log_metrics("test", results)
     
 
 if __name__ == "__main__":

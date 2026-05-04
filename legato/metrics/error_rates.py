@@ -16,7 +16,13 @@ def error_rate(preds, refs, desc="error rate", num_workers=8):
             desc=f"computing {desc}...",
             total=len(preds)
         ))
-    return sum(dists) / sum(len(r) for r in refs) * 100
+    total = sum(len(r) for r in refs)
+    if total == 0:
+        # Datasets without ABC ground truth (e.g. MUSCIMA++) reach here.
+        # SER/CER are undefined; the caller should fall back to OMR-NED /
+        # TEDn against MusicXML for those benchmarks.
+        return float("nan")
+    return sum(dists) / total * 100
 
 def compute_error_rates(
     tokenizer: PreTrainedTokenizer, 
